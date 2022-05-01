@@ -8,7 +8,9 @@ type t =
   ; mutable reading : bool
   ; mutable is_closed : bool
   ; closed : unit Ivar.t
-  ; buf : Bytebuffer.t
+  ; buf : Bigstring.t
+  ; mutable pos_read : int
+  ; mutable pos_fill : int
   }
 [@@deriving sexp_of]
 
@@ -21,17 +23,24 @@ let create ?buf_len fd =
       then buf_len
       else
         raise_s
-          [%message "Reader.create got negative buf_len" (buf_len : int) (fd : Fd.t)]
+          [%message "Input_channel.create got negative buf_len" (buf_len : int) (fd : Fd.t)]
   in
   { fd
   ; reading = false
   ; is_closed = false
   ; closed = Ivar.create ()
-  ; buf = Bytebuffer.create buf_len
+  ; buf = Bigstring.create buf_len
+  ; pos_read = 0
+  ; pos_fill = 0
   }
 ;;
 
-let consume t n = Bytebuffer.drop t.buf n
+let consume t len =
+  if len < 0 || len > t.pos_fill - t.pos_read
+  then invalid_argf "Input_channel.consume: index out of bounds %d" len ();
+  t.pos_read <- t.pos_read + len
+;;
+
 let is_closed t = t.is_closed
 let closed t = Ivar.read t.closed
 
@@ -43,14 +52,27 @@ let close t =
   closed t
 ;;
 
+let compact t =
+  if t.pos_read > 0
+  then (
+    let len = t.pos_fill - t.pos_read in
+    Bigstring.blit ~src:t.buf ~dst:t.buf ~src_pos:t.pos_read ~dst_pos:0 ~len;
+    t.pos_read <- 0;
+    t.pos_fill <- len)
+;;
+
 let refill_nonblocking t =
-  Bytebuffer.compact t.buf;
-  if Bytebuffer.available_to_write t.buf = 0
+  compact t;
+  if Bigstring.length t.buf - t.pos_fill = 0
   then `Buffer_is_full
   else (
     let result =
       Fd.syscall_result_exn ~nonblocking:true t.fd t.buf (fun fd buf ->
-          Bytebuffer.read_assume_fd_is_nonblocking fd buf)
+          Bigstring_unix.read_assume_fd_is_nonblocking
+            ~pos:t.pos_fill
+            ~len:(Bigstring.length t.buf - t.pos_fill)
+            fd
+            buf)
     in
     if Unix.Syscall_result.Int.is_ok result
     then (
@@ -58,6 +80,7 @@ let refill_nonblocking t =
       | 0 -> `Eof
       | n ->
         assert (n > 0);
+        t.pos_fill <- t.pos_fill + n;
         `Read_some)
     else (
       match Unix.Syscall_result.Int.error_exn result with
@@ -68,10 +91,9 @@ let refill_nonblocking t =
 ;;
 
 let view t =
-  let buf = Bytebuffer.unsafe_buf t.buf in
-  let pos = Bytebuffer.pos t.buf in
-  let len = Bytebuffer.length t.buf in
-  Core_unix.IOVec.of_bigstring buf ~pos ~len
+  let pos = t.pos_read in
+  let len = t.pos_fill - t.pos_read in
+  Core_unix.IOVec.of_bigstring t.buf ~pos ~len
 ;;
 
 let rec refill t =
@@ -90,14 +112,24 @@ let rec refill t =
         raise_s
           [%message "Shuttle.Input_channel.read: bad file descriptor" ~fd:(t.fd : Fd.t)]))
   else (
-    Bytebuffer.compact t.buf;
-    if Bytebuffer.available_to_write t.buf = 0
+    compact t;
+    if Bigstring.length t.buf - t.pos_fill = 0
     then return `Buffer_is_full
     else (
       match%map
         Fd.syscall_in_thread t.fd ~name:"read" (fun fd ->
-            let count = Bytebuffer.read fd t.buf in
-            if count = 0 then `Eof else `Ok)
+            let count =
+              Bigstring_unix.read
+                ~pos:t.pos_fill
+                ~len:(Bigstring.length t.buf - t.pos_fill)
+                fd
+                t.buf
+            in
+            if count = 0
+            then `Eof
+            else (
+              t.pos_fill <- t.pos_fill + count;
+              `Ok))
       with
       | `Already_closed -> `Eof
       | `Error (Bigstring_unix.IOError (0, End_of_file)) -> `Eof
@@ -113,7 +145,11 @@ let transfer t writer =
     >>> function
     | `Eof -> Ivar.fill_if_empty finished ()
     | `Buffer_is_full | `Ok ->
-      let payload = Bytebuffer.Consume.stringo t.buf in
+      let len = t.pos_fill - t.pos_read in
+      let payload =
+        Bigstring.To_string.sub t.buf ~pos:t.pos_read ~len:(t.pos_fill - t.pos_read)
+      in
+      consume t len;
       Pipe.write writer payload >>> fun () -> loop ()
   in
   loop ();
@@ -129,7 +165,7 @@ let pipe t =
 let drain t = Pipe.drain (pipe t)
 
 let rec read_line_slow t acc =
-  if Bytebuffer.length t.buf = 0
+  if t.pos_fill - t.pos_read = 0
   then (
     match%bind refill t with
     | `Eof ->
@@ -143,41 +179,51 @@ let rec read_line_slow t acc =
         false
     | `Ok -> read_line_slow t acc)
   else (
-    let idx = Bytebuffer.index t.buf '\n' in
+    let idx =
+      Bigstring.unsafe_find t.buf '\n' ~pos:t.pos_read ~len:(t.pos_fill - t.pos_read)
+    in
     if idx > -1
     then (
-      let buf = Bytebuffer.unsafe_buf t.buf in
-      let pos = Bytebuffer.pos t.buf in
+      let idx = idx - t.pos_read in
+      let buf = t.buf in
+      let pos = t.pos_read in
       let len = idx in
       if len >= 1 && Char.equal (Bigstring.get buf (pos + idx - 1)) '\r'
       then (
         let line = Bigstring.To_string.sub buf ~pos ~len:(idx - 1) in
-        Bytebuffer.drop t.buf (len + 1);
+        consume t (len + 1);
         return (`Ok (line :: acc)))
       else (
         let line = Bigstring.To_string.sub buf ~pos ~len in
-        Bytebuffer.drop t.buf (len + 1);
+        consume t (len + 1);
         return (`Ok (line :: acc))))
     else (
-      let curr = Bytebuffer.Consume.stringo t.buf in
+      let len = t.pos_fill - t.pos_read in
+      let curr =
+        Bigstring.To_string.sub t.buf ~pos:t.pos_read ~len:(t.pos_fill - t.pos_read)
+      in
+      consume t len;
       read_line_slow t (curr :: acc)))
 ;;
 
 let read_line t =
-  let idx = Bytebuffer.index t.buf '\n' in
+  let idx =
+    Bigstring.unsafe_find t.buf '\n' ~pos:t.pos_read ~len:(t.pos_fill - t.pos_read)
+  in
   if idx > -1
   then (
-    let buf = Bytebuffer.unsafe_buf t.buf in
-    let pos = Bytebuffer.pos t.buf in
+    let idx = idx - t.pos_read in
+    let buf = t.buf in
+    let pos = t.pos_read in
     let len = idx in
     if len >= 1 && Char.equal (Bigstring.get buf (pos + idx - 1)) '\r'
     then (
       let line = Bigstring.To_string.sub buf ~pos ~len:(idx - 1) in
-      Bytebuffer.drop t.buf (len + 1);
+      consume t (len + 1);
       return (`Ok line))
     else (
       let line = Bigstring.To_string.sub buf ~pos ~len in
-      Bytebuffer.drop t.buf (len + 1);
+      consume t (len + 1);
       return (`Ok line)))
   else (
     match%map read_line_slow t [] with
